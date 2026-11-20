@@ -3494,6 +3494,26 @@ The two read files use different parsing rules:
 
 `FM_VOICE_RELAY` and `FM_VOICE_PYTHON` belong to the laptop rather than to a home, so they have no config file: `bin/fm-voice-client.py` requires the relay path as a flag or that variable and carries no default path.
 
+## Per-check interval (state/<id>.check-interval)
+
+`FM_CHECK_INTERVAL` is one cadence for every slow check.
+A registered custom check can run on its own cadence instead, so a cheap local query can poll often without making the merge polls and the other checks run more often.
+
+Register the check with `bin/fm-check-register.sh <id> --interval <seconds>`, or write the number into `state/<id>.check-interval` yourself.
+The file holds one whole number of seconds.
+The watcher then runs that check once its own last run, recorded in `state/<id>.check-last`, is at least that old, even when the shared sweep is not due.
+
+- The shared sweep skips a check that has a valid interval, so it never runs twice, and the fast pass never touches `state/.last-check`, so the other checks keep exactly their shared cadence.
+- A check without an interval file behaves exactly as before, including its trust check, `FM_CHECK_TIMEOUT`, and wake format.
+- The value is floored at `FM_POLL` (default 15), because the watcher only looks between poll cycles.
+  The check runs on the first cycle at or after its interval, so its period is the interval rounded up to a poll cycle.
+- A non-numeric or zero value is ignored: the check keeps the shared cadence, and the watcher logs that once per check.
+- Only a registered custom check takes an interval.
+  The Relay check and merge polls are unaffected.
+- The watcher reads the file on every cycle, so changing or removing it needs no restart.
+  This differs from `FM_CHECK_INTERVAL`, which is read only at process start.
+- `bin/fm-check-unregister.sh <id>` removes both files with the check.
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):
@@ -3560,6 +3580,7 @@ FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_INACTIVE_RECONCILE_SECS=900  # 60..1800-second watcher cadence and inactivity threshold; locked session start also requests an immediate scan in the deferred worker
 FM_INACTIVE_RECONCILE_BUDGET_SECS=10  # 1..30-second scan deadline; wedged-scan kill backstop follows one second later
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or Relay dispatch)
+# A registered custom check can run on its own faster cadence instead; see "Per-check interval" above
 FM_TASK_INBOX_GRACE_SECS=90   # seconds an unhandled steering-inbox message may sit before the watcher attempts doorbell delivery on an idle endpoint; also the minimum spacing between attempts
 FM_TASK_INBOX_RING_MAX=3      # watcher delivery attempts without an acknowledgement before the task surfaces as a stale wake for recovery
 FM_TASK_INBOX_BUSY_MAX=2      # consecutive busy-deferred due polls before a stuck-busy stale wake; 1..999999999, at most 9 decimal digits, otherwise 2; policy: bin/fm-task-inbox-lib.sh

@@ -3223,6 +3223,44 @@ age_of() {  # seconds since file mtime; "due immediately" if missing
   echo $(( now - m ))
 }
 
+# Per-check cadence: a registered custom check may run faster than the shared
+# FM_CHECK_INTERVAL sweep through state/<id>.check-interval, one decimal number
+# of seconds (docs/configuration.md "Per-check interval"). It is read every
+# cycle, so a change needs no watcher restart. The value is floored at POLL,
+# since no check can run more often than the watcher cycles. A non-numeric or
+# zero value is ignored, so the check keeps the shared cadence, and is logged
+# once per check for this process. Sets CHECK_OWN_INTERVAL on success.
+CHECK_OWN_INTERVAL=
+CHECK_OWN_INTERVAL_LOGGED=
+check_own_interval() {  # <id>
+  local id=$1 file v
+  CHECK_OWN_INTERVAL=
+  file="$STATE/$id.check-interval"
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  IFS= read -r v < "$file" 2>/dev/null || [ -n "$v" ] || v=
+  v=$(printf '%s' "$v" | tr -d '[:space:]')
+  case "$v" in
+    ''|*[!0-9]*) v= ;;
+  esac
+  if [ -n "$v" ] && [ "${#v}" -le 9 ]; then
+    v=$((10#$v))
+  else
+    v=0
+  fi
+  if [ "$v" -le 0 ]; then
+    case "$CHECK_OWN_INTERVAL_LOGGED" in
+      *"|$id|"*) ;;
+      *)
+        CHECK_OWN_INTERVAL_LOGGED="$CHECK_OWN_INTERVAL_LOGGED|$id|"
+        triage_log "ignoring invalid per-check interval for $id; using the shared cadence"
+        ;;
+    esac
+    return 1
+  fi
+  [ "$v" -ge "$POLL" ] || v=$POLL
+  CHECK_OWN_INTERVAL=$v
+}
+
 # Layer 2 + 3 signal scan: status files and turn-end markers.
 # Each file is compared against its persisted reported signature in .seen-* rather
 # than mtime-vs-a-startup-touch, so signals that land while no watcher is running
@@ -4208,6 +4246,29 @@ while :; do
   # keeps producing signals - the slow poll (e.g. merge detection) would then
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
+  # Registered custom checks with their own state/<id>.check-interval run here
+  # on that cadence instead, tracked by state/<id>.check-last. This pass leaves
+  # .last-check alone, so a fast check never changes how often the shared
+  # sweep below runs, and the sweep skips these checks so none runs twice.
+  for ci in "$STATE"/*.check-interval; do
+    [ -e "$ci" ] || continue
+    own_id=$(basename "$ci" .check-interval)
+    [ "$own_id" != x-watch ] || continue
+    check_own_interval "$own_id" || continue
+    [ "$(age_of "$STATE/$own_id.check-last")" -ge "$CHECK_OWN_INTERVAL" ] || continue
+    if ! fm_custom_check_snapshot_prepare "$STATE" "$own_id"; then
+      fm_custom_check_snapshot_cleanup
+      continue
+    fi
+    touch "$STATE/$own_id.check-last"
+    run_check_capture "$FM_CUSTOM_CHECK_SNAPSHOT" || exit 1
+    out=$FM_CHECK_RESULT
+    fm_custom_check_snapshot_cleanup
+    [ -n "$out" ] || continue
+    reason="check: $STATE/$own_id.check.sh: $(printf '%s' "$out" | fm_wake_clean_field)"
+    fm_wake_append check "$STATE/$own_id.check.sh" "$reason" || exit 1
+    wake "$reason"
+  done
   if [ "$(age_of "$STATE/.last-check")" -ge "$CHECK_INTERVAL" ]; then
     rejected_checks=
     contribution_check_output=
@@ -4223,6 +4284,11 @@ while :; do
     fi
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
+      own_id=$(basename "$c" .check.sh)
+      if [ "$own_id" != x-watch ] && check_own_interval "$own_id" \
+        && fm_custom_check_registered "$STATE" "$own_id"; then
+        continue
+      fi
       is_pr_poll=0
       if [ "$(basename "$c")" = x-watch.check.sh ]; then
         if fmx_poll_shim_valid "$c" "$FM_HOME" "$FM_ROOT" \
